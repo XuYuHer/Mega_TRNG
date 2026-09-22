@@ -1,28 +1,48 @@
 # MegaTRNG
 
-> **让 ATmega2560 的真实模拟噪声，变成可审计、可测量、可直接使用的随机字节。**
+> **Real analogue noise in, auditable random bytes out — tuned for the ATmega2560.**
 >
-> **Turn real analogue noise on an ATmega2560 into auditable, measurable random bytes.**
+> **把 ATmega2560 的真实模拟噪声变成可审计、可测量的随机字节。**
 
 ![MegaTRNG demo](docs/mega-trng-demo.gif)
 
-`docs/mega-trng-demo.gif` 是演示位：把串口输出、Timer1 基准测试和测试结果录成 GIF 后放在这里即可。
+<!-- GIF slot: replace docs/mega-trng-demo.gif with a board capture when you have one. -->
 
-| 方案 | 真实物理熵 | 在线去偏 | Mega2560 不加外设 | 代码可审计 |
-|---|---:|---:|---:|---:|
-| **MegaTRNG（本项目）** | ADC 量化噪声 + 独立 WDT 相位 | Von Neumann | 是，需可用的模拟噪声输入 | 是 |
-| `randomSeed(analogRead())` | 可能只有一次 ADC 读数 | 否 | 是 | 是 |
-| LCG / xorshift / 固定种子 PRNG | 否 | 不适用 | 是 | 是 |
-| 外接 avalanche / 噪声芯片 | 是 | 取决于芯片 | 否 | 取决于芯片 |
+MegaTRNG is a small, dependency-free PlatformIO/Arduino library for the
+Arduino Mega2560. The default path samples the LSB of a noisy or floating ADC
+input, removes first-order bias with non-overlapping Von Neumann pairs, and
+diffuses the accepted bits through a 128-bit ARX state. Timer1 phase and the
+independent watchdog oscillator add physical timing disturbance as seasoning;
+they are never presented as a deterministic counter becoming entropy.
 
-表格是架构对比，不是对其他项目的统一实验室排名。MegaTRNG 不伪造跨硬件平台的吞吐或熵率数据；请用仓库中的示例在自己的板子上测量。
+MegaTRNG 是面向 Arduino Mega2560 的小型、无第三方依赖 PlatformIO/Arduino 库。
+默认路径采集噪声 ADC 输入的最低位，用不重叠 Von Neumann 对去除一阶偏置，再用
+128 位 ARX 状态扩散。Timer1 相位和独立看门狗振荡器只作为物理时序扰动加入，
+不会把确定性计数器冒充成熵源。
 
-## English first steps
+## Why star this project
 
-1. Open `A0` as a high-impedance analogue noise node. A genuinely noisy sensor or a documented noise circuit is better than a quiet, driven DC source.
-2. Open this folder in VS Code with the PlatformIO extension.
-3. Build and upload `megaatmega2560`, then open a 115200-baud serial monitor.
-4. Read the printed Timer1 `us/byte`, flash/RAM report and three small statistical smoke tests.
+| Mode | Physical path | Intended use | What is measured here |
+|---|---|---|---|
+| `Config()` | One ADC LSB, `/16`, optional Timer1/WDT seasoning | Conservative Mega2560 deployment | Compiles; board throughput must be measured by the included sketch |
+| `Config::fast()` | Same LSB, ADC free-running | Lower per-sample software overhead | Same physical sampling floor; no fabricated cycle claim |
+| `Config::turbo()` | Four low ADC planes, free-running `/2`, per-plane VN and reservoir | Explicit throughput experiment | Compiles; `/2` timing and cross-plane independence remain hardware-validation work |
+
+The conservative `/16` path has a **theoretical** ADC conversion floor near
+416 µs/byte at 16 MHz (32 raw conversions × 13 µs under an ideal unbiased model).
+Turbo's ideal source-side floor is near 13 µs/byte (8 conversions × 1.625 µs),
+but that number is not a board measurement and does not prove four independent
+bits. See the [comparison report](docs/COMPARISON.md) for the assumptions and
+fair measurement procedure.
+
+The repository never claims to have “beaten every project” without a same-board
+log. A quiet or driven ADC pin is detected and stops output; there is no PRNG
+fallback seeded from `millis()`, a fixed constant, or `random()`.
+
+## Quick start
+
+Keep A0 high impedance or connect a documented analogue noise source. A stable
+0 V or 5 V input is intentionally treated as a health failure.
 
 ```cpp
 #include <TRNG.h>
@@ -31,8 +51,8 @@ TRNG rng;
 
 void setup() {
   Serial.begin(115200);
-  TRNG::Config cfg;
-  cfg.adcChannel = 0;                 // A0
+  TRNG::Config cfg;                 // conservative, conventional ADC timing
+  cfg.adcChannel = 0;               // A0
   cfg.adcPrescaler = TRNG::ADC_DIV_16;
   cfg.enableWatchdog = 1;
   cfg.claimTimer1 = 1;
@@ -43,59 +63,60 @@ void setup() {
 
 void loop() {
   uint8_t byte = 0;
-  if (rng.next(byte, 0)) {
+  if (rng.next(byte, 0)) {          // 0 means wait until a byte is ready
     Serial.println(byte, HEX);
   }
 }
 ```
 
-`next(byte, 0)` deliberately waits for eight debiased bits. Use a non-zero second argument when a cooperative loop needs a bound:
+For the lower-overhead backend:
 
 ```cpp
-uint8_t byte;
-if (!rng.next(byte, 64)) {
-  // No byte within 64 ADC samples, or a health fault was detected.
+TRNG::Config cfg = TRNG::Config::fast();
+cfg.adcChannel = 0;
+rng.begin(cfg);
+```
+
+For the explicit experiment (read the limitations first):
+
+```cpp
+TRNG::Config cfg = TRNG::Config::turbo();
+cfg.adcChannel = 0;
+if (!rng.begin(cfg)) {
+  // Invalid mask, resource conflict, or an immediate health failure.
 }
 ```
 
-## 中文快速开始
+`next(byte, limit)` bounds the number of new ADC conversions. It returns
+`false` on timeout or a health fault and never substitutes deterministic data.
+`fill(buffer, length)` uses the same path until it reaches the requested length
+or a fault. Prefer the reference overload in production; the `next()` wrapper
+returns zero on failure for Arduino-style convenience.
 
-把 A0 保持高阻浮空，或接入你能说明来源的模拟噪声电路。不要把 A0 接到稳定的 0 V、5 V 或低噪声直流电压上；那样库应当报告健康故障。用 VS Code + PlatformIO 打开本目录，执行：
+## Entropy path
 
-```text
-PlatformIO: Build
-PlatformIO: Upload
-PlatformIO: Monitor（115200）
-```
+1. **ADC quantisation noise.** The source bit is an ADC result bit from the
+   configured analogue pin. Use a genuinely noisy node; a floating pin is an
+   experiment, not a quantified security source.
+2. **Timing seasoning.** Timer1 runs freely at the CPU clock and its sampled
+   phase is folded into a rolling digest. The watchdog oscillator contributes
+   occasional interrupt phase. Neither counter is used as a raw output bit.
+3. **Non-overlapping extraction.** Each enabled plane keeps its own previous
+   bit. `01` and `10` become one accepted bit; `00` and `11` are discarded, and
+   a pair is never reused in an overlapping window.
+4. **Small state mixer.** A 128-bit ARX state absorbs a digest and the accepted
+   byte. It spreads physical input across successive outputs; it is not a
+   cryptographic proof or a replacement for an entropy estimate.
+5. **Health stop.** A 128-sample equal-bit run or an extreme 256-sample
+   per-plane proportion stops the generator. Failure is visible through
+   `healthFault()` and `ready()`.
 
-命令行等价物：
-
-```bash
-pio run
-pio run -t upload
-pio device monitor -b 115200
-```
-
-`src/main.cpp` 会打印随机字节、Timer1 测得的 `µs/byte` 与 CPU 周期、链接器统计的 Flash/RAM，以及频率、游程、128-bit 块频率三个烟雾测试。统计测试不是 NIST 认证，也不能替代熵源审计。
-
-## Entropy path / 熵源路径
-
-1. **ADC physical sample.** The least-significant bit of a conversion on `adcChannel` is the only bit presented to the debiaser. The default is AVcc reference, right-aligned 10-bit ADC, and `/16` ADC clock (`1 MHz` at 16 MHz CPU). The input must carry physical variation; a deterministic firmware value is never substituted.
-2. **Timer1 phase metadata.** Timer1 can be claimed and run at `F_CPU/1`. Its phase is absorbed into the state around each conversion. A counter is not called entropy: it only exposes timing changes to the mixer.
-3. **Watchdog oscillator.** When enabled, the independent watchdog oscillator interrupts at its shortest nominal period (about 16 ms on this family). The ISR samples Timer1 phase and injects the event into the mixer. This is a slow secondary source, not the throughput source.
-4. **Von Neumann debiasing.** Non-overlapping pairs `01 -> 0`, `10 -> 1`; `00` and `11` are discarded. A pair is never reused in an overlapping window.
-5. **ARX state mixer.** A 128-bit in-RAM state diffuses samples and provides forward evolution between output bytes. It is a mixer, not an entropy source and not a cryptographic certification.
-6. **Health monitors.** A run of 128 equal raw bits or an extreme 256-bit adaptive-proportion window stops output. This catches common open/shorted-input failures without pretending that a health test proves randomness.
-
-The Von Neumann extractor removes first-order bias when successive raw bits are independent enough. It cannot create entropy from a stuck pin, and the library intentionally has no deterministic fallback.
-
-### 中文原理与接口摘要
-
-高吞吐路径只取 ADC 转换结果的最低位；A0 必须接触真实模拟变化，固件不会用计时器、线性同余或固定种子补位。Timer1 的相位和独立 WDT 振荡器事件只作为第二时钟的物理扰动注入 128 位状态，不能把确定性计数器冒充熵源。ADC 原始位按不重叠二元组执行 `01→0`、`10→1`，`00/11` 丢弃，再由 ARX 状态扩散输出。
-
-`begin()` 保存并配置 ADC、Timer1 和 WDT；`end()` 恢复寄存器。`next(out, 0)` 会阻塞直到得到一个字节，`next(out, 上限)` 在指定 ADC 样本数内没有得到字节就返回 `false`，`fill()` 用同一条路径填充缓冲区。`ready()` 和 `healthFault()` 用来检查健康状态；发生长重复或极端 256 位比例时，库停止输出，不降级到伪随机。
-
-默认 `/16` ADC 分频在 16 MHz 下有约 13 µs 的单次转换下界；Von Neumann 去偏后的八位预计需要约 32 次原始采样，因此 416 µs/byte 只是理论下界。请以 `src/main.cpp` 的 Timer1 结果为准，并同时记录接线、参考电压和编译参数。
+Turbo enables four low ADC planes from each conversion. Each plane is debiased
+independently, and surplus accepted bits are retained in a small reservoir so
+one conversion is not thrown away at a byte boundary. Bits from the same ADC
+conversion can still be correlated; the library therefore calls turbo a
+candidate multi-plane path and requires raw-capture validation before a security
+claim.
 
 ## API
 
@@ -103,100 +124,167 @@ The Von Neumann extractor removes first-order bias when successive raw bits are 
 
 | Field | Default | Meaning |
 |---|---:|---|
-| `adcChannel` | `0` | External ADC channel `0..15` (`A0..A15`). Leave it floating or attach a physical noise source. |
-| `adcPrescaler` | `ADC_DIV_16` | ADPS bits. `/16` is fast; `/32`, `/64` and `/128` trade throughput for conventional ADC timing. |
-| `warmupSamples` | `64` | ADC conversions absorbed before output. |
-| `enableWatchdog` | `1` | Add independent watchdog-oscillator phase events. With the default compile flag, the library owns `WDT_vect`; do not define a second WDT ISR in the application. |
-| `claimTimer1` | `1` | Save/configure/restore Timer1 as a free-running phase counter. Set `0` if another subsystem owns it. |
+| `adcChannel` | `0` | ADC channel `0..15` (`A0..A15`). Leave it noisy or high impedance. |
+| `adcPrescaler` | `ADC_DIV_16` | ADPS bits. `/16` is the conservative speed-oriented default. |
+| `warmupSamples` | `64` | Samples absorbed and health-checked before output. |
+| `enableWatchdog` | `1` | Own the WDT interrupt and add independent oscillator phase events. |
+| `claimTimer1` | `1` | Save/configure/restore Timer1 as a free-running phase counter. |
+| `freeRunning` | `0` | Keep ADC conversions continuous when set. `Config::fast()` and `turbo()` set it. |
+| `bitPlaneMask` | `0x01` | Enabled ADC planes 0..3. `0x01` is the conservative path; `0x0F` is turbo. |
 
-For a smaller build, compile-time flags remove the corresponding seasoning path completely:
+`Config::fast()` selects free-running ADC at `/16`. `Config::turbo()` selects
+free-running `/2` and mask `0x0F`; `/2` is outside the conventional 50–200 kHz
+ADC accuracy range and is intentionally opt-in.
+
+Compile-time flags remove seasoning code when the application does not need it:
 
 ```ini
 build_flags =
   -DMEGATRNG_ENABLE_WATCHDOG=0
   -DMEGATRNG_ENABLE_TIMER1_PHASE=0
+  -DMEGATRNG_ENABLE_WIDE_PLANES=0
 ```
 
-Runtime configuration cannot re-enable a path removed this way. The ADC source and Von Neumann extractor remain present.
+The third flag removes the experimental multi-plane loops from a conservative
+small build; that build accepts only `bitPlaneMask = 0x01`.
 
 ### Methods
 
-- `bool begin()` / `bool begin(const Config&)`: save affected registers, initialise ADC, optionally claim Timer1 and WDT, and absorb warm-up samples.
-- `void end()`: restore saved ADC, Timer1, digital-input and watchdog registers.
-- `bool next(uint8_t& out, uint16_t maxRawSamples = 0)`: return one byte. `0` waits; a non-zero limit bounds the call. Returns `false` on timeout or health fault.
-- `uint8_t next()`: convenience wrapper; returns zero on failure, so production code should prefer the reference overload.
-- `size_t fill(void* buffer, size_t length)`: blocking fill until complete or a health fault.
-- `ready()`, `started()`, `healthFault()`: status probes. `rawSamples()` and `acceptedBits()` expose counters for diagnostics.
+- `bool begin()` / `bool begin(const Config&)`: save affected registers,
+  configure the ADC, optionally claim Timer1 and WDT, and absorb warm-up samples.
+- `void end()`: stop free-running ADC, restore saved ADC/Timer1/DIDR/WDT state.
+- `bool next(uint8_t& out, uint16_t maxRawSamples = 0)`: get one byte;
+  `0` waits, a non-zero limit bounds new conversions.
+- `uint8_t next()`: convenience wrapper that returns zero if the reference call
+  fails.
+- `size_t fill(void* buffer, size_t length)`: fill until complete or a fault.
+- `ready()`, `started()`, `healthFault()`: status; `rawSamples()` and
+  `acceptedBits()` expose diagnostic counters.
 
-Timer1, the ADC multiplexer and (when compiled in) the watchdog vector are shared MCU resources. Call `end()` before another subsystem needs the registers, and do not provide a competing `WDT_vect` handler in the same link. Set the corresponding configuration flag when you accept weaker timing seasoning.
+Timer1, the ADC multiplexer and the WDT vector are shared MCU resources. Call
+`end()` before another subsystem needs them and do not install a second
+`WDT_vect` handler in the same link.
 
-## Performance and size
+## Performance, size and measurement
 
-At `/16`, one ADC conversion has a 13-cycle ADC conversion floor, or about **13 µs** at 16 MHz. A Von Neumann accepted bit costs an expected four raw bits, so eight output bits have a physical-sampling floor near **416 µs/byte** before register and mixer overhead. The actual rate depends on ADC noise, bias and rejection; a quiet input can take arbitrarily longer and will eventually fail health checks.
+The included `src/main.cpp` and `examples/Benchmark` measure each byte with
+Timer1, print CPU cycles and µs/byte, run frequency/runs/128-bit-block smoke
+tests, and print linker symbols plus `sizeof(TRNG)`. The Timer1 counter wraps in
+4.096 ms, so keep each measurement interval below that limit or use a wider
+measurement harness.
 
-The demo measures each byte with Timer1; each individual timing interval must stay below one 4.096 ms counter wrap. It also prints the linker result. A build from this repository currently compiles for `megaatmega2560`; the exact numbers below are build- and demo-dependent:
+Known from this checkout before a board run:
 
-| Measurement | What is known before a board run |
-|---|---|
-| Throughput | 416 µs/byte is a sampling floor at `/16`; no hardware throughput claim is made here. |
-| Flash | This checkout's default demo build: **7,556 bytes**; `megaatmega2560_min`: **7,226 bytes**. PlatformIO `pio run` is authoritative for your toolchain. |
-| RAM | This checkout's default demo build: **505 bytes**; minimal seasoning build: **502 bytes**. The library object itself is **52 bytes**; the demo additionally allocates a 256-byte test buffer and Arduino Serial state. |
+| Build | Flash | Static RAM | Status |
+|---|---:|---:|---|
+| `megaatmega2560` demo | **7,882 B** | **521 B** | PlatformIO build with `-Os -flto`, not a board throughput measurement |
+| `megaatmega2560_min` demo | **7,254 B** | **518 B** | Watchdog, Timer1 seasoning and wide-plane loops compiled out |
 
-Do not quote the floor as a measured result. Copy the serial output from your exact board, ADC reference, wiring and compiler flags when publishing a benchmark.
+The `/16` 416 µs/byte and turbo `/2` 13 µs/byte values are conversion floors
+under stated ideal assumptions. They exclude software and do not certify entropy.
+Publish a board result only with the serial log, wiring, reference voltage,
+compiler flags and raw-sample statistics.
+
+Run the demo in VS Code + PlatformIO:
+
+```text
+pio run -e megaatmega2560
+pio run -t upload -e megaatmega2560
+pio device monitor -b 115200
+
+# size/minimal-path build
+pio run -e megaatmega2560_min
+
+# compile the library examples
+pio ci lib/MegaTRNG/examples/Basic/Basic.ino --board megaatmega2560 --lib=lib/MegaTRNG
+pio ci lib/MegaTRNG/examples/Benchmark/Benchmark.ino --board megaatmega2560 --lib=lib/MegaTRNG
+pio ci lib/MegaTRNG/examples/Turbo/Turbo.ino --board megaatmega2560 --lib=lib/MegaTRNG
+```
 
 ## Innovation / 创新点
 
-- **Two clocks, one honest boundary.** ADC quantisation noise is the high-rate path; the independent watchdog oscillator supplies a physically different timing disturbance. Timer1 is explicitly treated as phase metadata, never marketed as a random counter.
-- **Debias before diffusion.** Non-overlapping Von Neumann pairs sit before the 128-bit state, so the mixer cannot conceal a one-sided raw source.
-- **Resource-aware ownership.** All touched registers are saved and restored. `claimTimer1` and `enableWatchdog` make the shared-resource trade-off visible in the API.
-- **Bounded and blocking reads share one path.** `next(out, limit)` lets a cooperative application choose a latency bound without adding a second pseudo-random code path.
-- **Failure is observable.** Repetition and adaptive-proportion checks stop output instead of returning a seeded PRNG stream when the analogue node is dead.
-- **Small AVR footprint.** No heap, no third-party dependency, no lookup table and no floating point in the library core.
+- **Free-running ADC without an entropy shortcut.** `fast()` removes repeated
+  conversion setup while the output bit still comes from ADC noise.
+- **AVR-aware ARX hot path.** Output absorption uses fixed-count rotations and
+  one state absorption per byte, avoiding a generic variable-rotate helper.
+- **Parallel candidate planes with lossless byte boundaries.** `turbo()` runs
+  separate VN state per low bit plane and retains surplus accepted bits instead
+  of discarding them. Cross-plane independence is exposed as a validation task,
+  not hidden behind a benchmark claim.
+- **One hot path, two latency policies.** The bounded and blocking `next()` APIs
+  share the same extractor and health path; no fallback stream appears when a
+  caller asks for a latency bound.
+- **Resource ownership is explicit.** ADC, Timer1, digital-input-disable bits
+  and WDT settings are saved and restored.
+- **Failure is observable.** Stuck inputs stop output rather than silently
+  changing to a seeded PRNG.
+- **AVR-sized implementation.** No heap, floating point, lookup table or third-
+  party dependency is required by the library core.
 
-## Review loop / 自我审查记录
+## Self-review record
 
-1. **Round 1 — physical source audit.** Removed any idea of using `millis()` or a fixed-seed PRNG as a source; ADC LSB became the only debiased high-rate bit.
-2. **Round 2 — bias audit.** Made Von Neumann pairs non-overlapping and discarded equal pairs; a previous bit is never reused.
-3. **Round 3 — shared-resource audit.** Added register save/restore, an explicit Timer1 ownership flag and a watchdog ownership guard.
-4. **Round 4 — failure audit.** Added 128-bit repetition and 256-bit adaptive-proportion health stops, plus a bounded `next()` API.
-5. **Round 5 — size/speed audit.** Kept the core heap-free, used a 128-bit ARX mixer with no tables, and set `/16` as the speed-oriented default while documenting the ADC timing trade-off.
-6. **Round 6 — documentation audit.** Removed unmeasured leaderboard claims, made the 416 µs figure a theoretical floor, and added a board-side measurement procedure.
+1. **Physical-source review:** removed `millis()`, fixed-seed PRNG and counter
+   output; ADC noise is the high-rate source.
+2. **Bias review:** made VN pairs non-overlapping and discarded equal pairs.
+3. **Ownership review:** added register save/restore, one active instance and
+   explicit Timer1/WDT controls.
+4. **Failure review:** added repetition and adaptive-proportion stops plus a
+   bounded read API.
+5. **Hot-path review:** replaced full state absorption per raw sample with a
+   rolling digest and one absorption per output byte.
+6. **Backend review:** added free-running ADC and an opt-in multi-plane reservoir;
+   marked `/2` timing and cross-plane independence as unverified.
+7. **Footprint review:** added `MEGATRNG_ENABLE_WIDE_PLANES=0` so a conservative
+   build can remove experimental loops, in addition to the WDT/Timer1 flags.
+8. **Assembly review:** replaced the generic variable-rotate helper with
+   fixed-count AVR expressions and kept one ARX absorption per output byte.
+9. **Documentation review:** moved all speed numbers into a labelled
+   theoretical-floor table and added the source-linked comparison report.
 
-The design is at a practical documentation/code balance: further speed gains would require relaxing the extractor or ADC sampling assumptions, so this review loop has converged.
-
-### README self-check
-
-The largest weakness was an easy-to-misread speed claim: a theoretical ADC floor can look like a board benchmark. The performance section now labels it as a floor, points to the Timer1 measurement and requires the exact wiring/compiler output for any published number. One addition that makes the project stronger is the `megaatmega2560_min` PlatformIO environment: it proves that the watchdog and Timer1 seasoning paths can be compiled out for size experiments instead of being merely promised in prose.
+The design has converged for the current constraints. A further large speedup
+would require an ADC interrupt/ring-buffer design or relaxing the extractor;
+both change latency, RAM and validation assumptions enough to deserve a separate
+backend.
 
 ## Limits and honest claims / 限制与诚实声明
 
-- A floating ADC pin is an entropy opportunity, not a quantified entropy guarantee. For security work, add a characterised analogue noise source and perform a proper entropy estimate.
-- The watchdog oscillator is slow and process/voltage/temperature dependent. It improves source diversity but does not rescue a silent ADC input.
-- The ARX mixer is not a NIST-approved DRBG, and the included tests are smoke tests. Do not use this library as the sole key-generation primitive without an application-specific security review.
-- The library currently targets ATmega2560 and assumes the Arduino AVR register names. Other AVR parts may need a port.
-- Timer1 and the watchdog vector are shared resources. Integrate them deliberately with Servo, tone, bootloader watchdog or another WDT user; the default build provides the one `WDT_vect` handler for the library.
+- A floating ADC pin is not a quantified entropy source. Characterise the
+  analogue circuit and estimate min-entropy for security work.
+- `/2` ADC timing is outside the normal accuracy recommendation. Turbo is an
+  experiment until raw captures show stable, independent-enough planes.
+- The ARX mixer and included tests are not a NIST certification or a DRBG proof.
+  Do not use this library as the sole key-generation primitive without review.
+- The library targets ATmega2560 register names and assumes the Arduino AVR
+  core. Other AVR parts require a deliberate port.
+- Timer1 and the WDT vector are shared. Integrate them deliberately with Servo,
+  tone, bootloader watchdog or another WDT user.
+- No Mega2560 board was connected while this revision was prepared. The code
+  compiles; the serial throughput and noise quality remain user-measured data.
 
 ## Roadmap
 
-- Add an optional ADC free-running/ADC-noise-reduction backend with the same extractor API.
-- Add a host-side capture tool that records raw bits and computes a reproducible entropy estimate.
-- Add CI builds for a small matrix of Arduino AVR core versions.
-- Publish board-specific measurements only after collecting raw serial logs and wiring details.
+- Publish labelled Mega2560 raw captures and a reproducible entropy estimator.
+- Add a host tool for per-plane and cross-plane tests.
+- Add CI across several Arduino AVR core versions.
+- Add an optional ADC interrupt backend only after RAM and ISR costs are measured.
 
 ## Repository layout
 
 ```text
 lib/MegaTRNG/
-  src/TRNG.h, TRNG.cpp       library implementation
-  examples/Basic/             minimal serial example
-  examples/Benchmark/         Timer1 benchmark example
-  library.json                PlatformIO metadata
-  library.properties          Arduino Library Manager metadata
-src/main.cpp                  complete demo and smoke tests
-platformio.ini                Mega2560 build configuration
-CHANGELOG.md                  release history
-LICENSE                       MIT license
-.github/ISSUE_TEMPLATE/      issue forms
+  src/TRNG.h, TRNG.cpp             library implementation
+  examples/Basic/                  minimal serial example
+  examples/Benchmark/              Timer1 benchmark
+  examples/Turbo/                  explicit multi-plane experiment
+  library.json                     PlatformIO metadata
+  library.properties               Arduino Library Manager metadata
+src/main.cpp                       demo, size report and smoke tests
+docs/COMPARISON.md                 source-linked comparison report
+docs/README.md                     documentation landing page
+platformio.ini                     Mega2560 build environments
+CHANGELOG.md                       release history
+.github/ISSUE_TEMPLATE/            issue forms
+LICENSE                             MIT license
 ```
 
 ## License

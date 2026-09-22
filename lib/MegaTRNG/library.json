@@ -1,12 +1,8 @@
 {
   "name": "MegaTRNG",
-  "version": "0.1.0",
-  "description": "Physical-noise TRNG for Arduino Mega 2560 using ADC noise, Timer1 phase and watchdog jitter",
-  "keywords": ["trng", "random", "entropy", "avr", "mega2560", "adc"],
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/yourname/MegaTRNG.git"
-  },
+  "version": "0.2.0",
+  "description": "Physical-noise TRNG for Mega2560 with ADC free-running and optional multi-plane extraction",
+  "keywords": ["trng", "random", "entropy", "avr", "mega2560", "adc", "von-neumann"],
   "authors": {
     "name": "MegaTRNG contributors",
     "maintainer": true

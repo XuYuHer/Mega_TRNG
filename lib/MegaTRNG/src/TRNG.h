@@ -33,6 +33,12 @@
 #define MEGATRNG_ENABLE_TIMER1_PHASE 1
 #endif
 
+// Set to 0 to compile out the experimental multi-plane backend.  The public
+// Config field remains source-compatible, but only mask 0x01 is accepted.
+#ifndef MEGATRNG_ENABLE_WIDE_PLANES
+#define MEGATRNG_ENABLE_WIDE_PLANES 1
+#endif
+
 class TRNG {
 public:
     enum : uint8_t {
@@ -51,8 +57,19 @@ public:
         uint16_t warmupSamples;   // conversions absorbed before first output
         uint8_t enableWatchdog;   // independent watchdog phase seasoning
         uint8_t claimTimer1;      // configure Timer1 as a free-running counter
+        uint8_t freeRunning;      // ADC free-running backend (lower per-sample overhead)
+        uint8_t bitPlaneMask;     // ADC bit planes 0..3; 0x01 is conservative
 
         Config();
+
+        // Fast keeps the conventional /16 ADC clock but starts conversions
+        // continuously, removing one ADSC setup per sample.
+        static Config fast();
+
+        // Turbo is an opt-in experiment: /2 ADC clock and four low bit planes.
+        // The ADC clock is outside the usual 50..200 kHz accuracy range and
+        // cross-plane independence must be validated on the user's hardware.
+        static Config turbo();
     };
 
     TRNG();
@@ -67,6 +84,7 @@ public:
     bool healthFault() const { return healthFault_; }
     uint32_t rawSamples() const { return rawSamples_; }
     uint32_t acceptedBits() const { return acceptedBits_; }
+    uint8_t bitPlaneMask() const { return config_.bitPlaneMask; }
 
     /*
      * Read one byte.  maxRawSamples == 0 waits until eight debiased bits are
@@ -95,14 +113,21 @@ private:
     Config config_;
     bool started_;
     volatile bool healthFault_;
-    uint8_t previousBit_;
-    uint8_t havePrevious_;
-    uint8_t lastRawBit_;
-    uint8_t rawRunLength_;
-    uint8_t windowBits_;
-    uint8_t windowOnes_;
+    uint8_t previousBits_;
+    uint8_t havePreviousBits_;
+    uint8_t lastHealthBits_;
+    uint8_t healthHaveBits_;
+    uint8_t healthWindowBits_;
+    uint8_t healthRunLength_[4];
+    uint8_t healthWindowOnes_[4];
     uint32_t rawSamples_;
     uint32_t acceptedBits_;
+    uint32_t sampleDigest_;
+
+    // A wide sample can yield more than one accepted bit. Keep surplus bits
+    // so no physical sample is silently discarded at a byte boundary.
+    uint16_t pendingValue_;
+    uint8_t pendingBits_;
 
     uint32_t s0_;
     uint32_t s1_;
@@ -131,12 +156,12 @@ private:
     void configureWatchdog();
     void restoreWatchdog();
     uint16_t sampleAdc();
-    uint8_t sampleRawBit();
-    void inspectRawBit(uint8_t bit);
+    void processSample(uint16_t value);
+    void acceptPlaneBit(uint8_t plane, uint8_t bit);
+    void mixSample(uint16_t value, uint8_t phase, uint8_t watchdogMix,
+                   uint8_t watchdogEvents);
     void absorbByte(uint8_t value);
-    void absorbBit(uint8_t bit);
-    uint8_t squeezeByte();
-    static uint32_t rotl32(uint32_t value, uint8_t amount);
+    uint8_t squeezeByte(uint8_t input);
 };
 
 #endif

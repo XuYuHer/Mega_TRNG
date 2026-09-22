@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.0 - 2026-09-22
+
+- Added a free-running ADC backend through `Config::fast()`.
+- Added opt-in `Config::turbo()` with four independently debiased candidate
+  planes and a surplus-bit reservoir.
+- Added per-plane repetition/proportion health checks and a Turbo example.
+- Added `docs/COMPARISON.md` with source-linked, non-fabricated comparisons.
+- Reduced output mixing to one ARX absorption per byte in the hot path.
+- Replaced the generic variable-rotate helper with fixed-count AVR rotations.
+- Documented the `/2` ADC-clock and cross-plane validation limits explicitly.
+
 ## 0.1.0 - 2026-09-22
 
 - Initial ATmega2560 implementation.

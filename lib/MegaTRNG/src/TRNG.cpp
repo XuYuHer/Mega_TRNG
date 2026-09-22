@@ -7,6 +7,9 @@
 #include <util/atomic.h>
 
 namespace {
+#define MEGATRNG_ROTL32(value, amount) \
+    ((uint32_t)(((value) << (amount)) | ((value) >> (32U - (amount)))))
+
 #if MEGATRNG_ENABLE_WATCHDOG
 volatile uint8_t g_wdtMix = 0;
 volatile uint8_t g_wdtEvents = 0;
@@ -21,20 +24,40 @@ TRNG::Config::Config()
       adcPrescaler(TRNG::ADC_DIV_16),
       warmupSamples(64),
       enableWatchdog(1),
-      claimTimer1(1) {}
+      claimTimer1(1),
+      freeRunning(0),
+      bitPlaneMask(0x01) {}
+
+TRNG::Config TRNG::Config::fast() {
+    Config config;
+    config.freeRunning = 1;
+    return config;
+}
+
+TRNG::Config TRNG::Config::turbo() {
+    Config config;
+    config.freeRunning = 1;
+    config.adcPrescaler = TRNG::ADC_DIV_2;
+    config.bitPlaneMask = 0x0F;
+    return config;
+}
 
 TRNG::TRNG()
     : config_(),
       started_(false),
       healthFault_(false),
-      previousBit_(0),
-      havePrevious_(0),
-      lastRawBit_(0),
-      rawRunLength_(0),
-      windowBits_(0),
-      windowOnes_(0),
+      previousBits_(0),
+      havePreviousBits_(0),
+      lastHealthBits_(0),
+      healthHaveBits_(0),
+      healthWindowBits_(0),
+      healthRunLength_{0, 0, 0, 0},
+      healthWindowOnes_{0, 0, 0, 0},
       rawSamples_(0),
       acceptedBits_(0),
+      sampleDigest_(0),
+      pendingValue_(0),
+      pendingBits_(0),
       s0_(0),
       s1_(0),
       s2_(0),
@@ -57,10 +80,6 @@ TRNG::~TRNG() {
     end();
 }
 
-uint32_t TRNG::rotl32(uint32_t value, uint8_t amount) {
-    return (uint32_t)((value << amount) | (value >> (32U - amount)));
-}
-
 bool TRNG::begin() {
     Config config;
     return begin(config);
@@ -73,9 +92,16 @@ bool TRNG::begin(const Config &config) {
     if (active_ != 0 && active_ != this) {
         return false;
     }
-    if (config.adcChannel > 15 || config.adcPrescaler > 7) {
+    if (config.adcChannel > 15 || config.adcPrescaler > 7 ||
+        (config.bitPlaneMask & 0x0FU) == 0 ||
+        (config.bitPlaneMask & 0xF0U) != 0) {
         return false;
     }
+#if !MEGATRNG_ENABLE_WIDE_PLANES
+    if (config.bitPlaneMask != 0x01U) {
+        return false;
+    }
+#endif
 
     config_ = config;
     savedAdmux_ = ADMUX;
@@ -97,14 +123,20 @@ bool TRNG::begin(const Config &config) {
     s1_ = 0x85A308D3UL;
     s2_ = 0x13198A2EUL;
     s3_ = 0x03707344UL;
-    previousBit_ = 0;
-    havePrevious_ = 0;
-    lastRawBit_ = 0;
-    rawRunLength_ = 0;
-    windowBits_ = 0;
-    windowOnes_ = 0;
+    previousBits_ = 0;
+    havePreviousBits_ = 0;
+    lastHealthBits_ = 0;
+    healthHaveBits_ = 0;
+    healthWindowBits_ = 0;
+    for (uint8_t plane = 0; plane < 4U; ++plane) {
+        healthRunLength_[plane] = 0;
+        healthWindowOnes_[plane] = 0;
+    }
     rawSamples_ = 0;
     acceptedBits_ = 0;
+    sampleDigest_ = 0xA4093822UL;
+    pendingValue_ = 0;
+    pendingBits_ = 0;
     healthFault_ = false;
     timerClaimed_ = 0;
     watchdogClaimed_ = 0;
@@ -141,8 +173,7 @@ bool TRNG::begin(const Config &config) {
             phase = (uint8_t)(TCNT1L ^ TCNT1H);
         }
 #endif
-        absorbByte((uint8_t)value ^ (uint8_t)(value >> 8) ^ phase);
-        inspectRawBit((uint8_t)(value & 1U));
+        mixSample(value, phase, 0, 0);
         if (healthFault_) {
             break;
         }
@@ -173,11 +204,16 @@ void TRNG::end() {
 }
 
 void TRNG::configureAdc() {
-    uint8_t channel = config_.adcChannel;
+    const uint8_t channel = config_.adcChannel;
     ADMUX = (uint8_t)(_BV(REFS0) | (channel & 0x0F));
 #if defined(MUX5)
     ADCSRB = (uint8_t)((ADCSRB & (uint8_t)~_BV(MUX5)) |
                        ((channel & 0x08U) ? _BV(MUX5) : 0));
+#endif
+    // ADTS=0 selects free running mode when ADATE is set.
+#if defined(ADTS0)
+    ADCSRB = (uint8_t)(ADCSRB & (uint8_t)~(_BV(ADTS0) | _BV(ADTS1) |
+                                           _BV(ADTS2)));
 #endif
 #if defined(DIDR0)
     if (channel < 8) {
@@ -189,8 +225,20 @@ void TRNG::configureAdc() {
         DIDR2 = (uint8_t)(DIDR2 | _BV(channel - 8));
     }
 #endif
-    ADCSRA = (uint8_t)(_BV(ADEN) | (config_.adcPrescaler & 0x07U));
+
+    uint8_t control = (uint8_t)(_BV(ADEN) | (config_.adcPrescaler & 0x07U));
+#if defined(ADATE)
+    if (config_.freeRunning) {
+        control = (uint8_t)(control | _BV(ADATE));
+    }
+#endif
+    ADCSRA = control;
     ADCSRA |= _BV(ADIF); // clear a possible stale completion flag
+    if (config_.freeRunning) {
+        // In free-running mode ADSC starts the first conversion and the ADC
+        // hardware starts every following conversion automatically.
+        ADCSRA |= _BV(ADSC);
+    }
 }
 
 void TRNG::configureTimer1() {
@@ -240,6 +288,16 @@ void TRNG::restoreHardware() {
 }
 
 uint16_t TRNG::sampleAdc() {
+    if (config_.freeRunning) {
+        while ((ADCSRA & _BV(ADIF)) == 0) {
+            // The watchdog ISR remains enabled while the ADC is converting.
+        }
+        const uint16_t value = ADC;
+        // Writing one clears ADIF and leaves the free-running trigger alive.
+        ADCSRA |= _BV(ADIF);
+        return value;
+    }
+
     ADCSRA |= _BV(ADSC);
     while ((ADCSRA & _BV(ADSC)) != 0) {
         // The watchdog ISR remains enabled while the ADC is converting.
@@ -247,12 +305,14 @@ uint16_t TRNG::sampleAdc() {
     return ADC;
 }
 
-uint8_t TRNG::sampleRawBit() {
-    uint16_t value = sampleAdc();
+void TRNG::processSample(uint16_t value) {
     uint8_t phase = 0;
 #if MEGATRNG_ENABLE_WATCHDOG
     uint8_t watchdogMix = 0;
     uint8_t watchdogEvents = 0;
+#else
+    const uint8_t watchdogMix = 0;
+    const uint8_t watchdogEvents = 0;
 #endif
     ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
 #if MEGATRNG_ENABLE_TIMER1_PHASE
@@ -265,82 +325,163 @@ uint8_t TRNG::sampleRawBit() {
 #endif
     }
 
-    // Timer phase and watchdog phase are seasoning for the state mixer.  The
-    // debiased bit itself comes from the ADC's physical LSB; this avoids
-    // presenting a deterministic counter as entropy.
-    absorbByte((uint8_t)value ^ (uint8_t)(value >> 8) ^ phase);
-#if MEGATRNG_ENABLE_WATCHDOG
-    if (watchdogEvents != 0) {
-        absorbByte((uint8_t)(watchdogMix ^ phase ^ watchdogEvents));
+    // Timer phase and watchdog phase season a rolling digest.  The debiased
+    // bits still come only from ADC bit planes; deterministic counters never
+    // become an entropy source by being mixed in here.
+    mixSample(value, phase, watchdogMix, watchdogEvents);
+
+#if MEGATRNG_ENABLE_WIDE_PLANES
+    const uint8_t mask = config_.bitPlaneMask;
+    for (uint8_t plane = 0; plane < 4U; ++plane) {
+        const uint8_t flag = (uint8_t)(1U << plane);
+        if ((mask & flag) != 0) {
+            acceptPlaneBit(plane, (uint8_t)((value >> plane) & 1U));
+        }
     }
+#else
+    acceptPlaneBit(0, (uint8_t)(value & 1U));
 #endif
-    uint8_t raw = (uint8_t)(value & 1U);
-    inspectRawBit(raw);
-    return raw;
 }
 
-void TRNG::inspectRawBit(uint8_t bit) {
-    bit &= 1U;
-    if (rawSamples_ == 0) {
-        lastRawBit_ = bit;
-        rawRunLength_ = 1;
-    } else if (bit == lastRawBit_) {
-        if (rawRunLength_ != 0xFFU) {
-            ++rawRunLength_;
+void TRNG::acceptPlaneBit(uint8_t plane, uint8_t bit) {
+    const uint8_t flag = (uint8_t)(1U << plane);
+    if ((havePreviousBits_ & flag) == 0) {
+        if (bit != 0) {
+            previousBits_ = (uint8_t)(previousBits_ | flag);
+        } else {
+            previousBits_ = (uint8_t)(previousBits_ & (uint8_t)~flag);
         }
-    } else {
-        lastRawBit_ = bit;
-        rawRunLength_ = 1;
+        havePreviousBits_ = (uint8_t)(havePreviousBits_ | flag);
+        return;
     }
 
-    // A long identical run catches an open circuit, a shorted input, and a
-    // dead ADC without rejecting ordinary analogue bias.
-    if (rawRunLength_ >= 128U) {
-        healthFault_ = true;
+    const uint8_t first = (previousBits_ & flag) != 0 ? 1U : 0U;
+    havePreviousBits_ = (uint8_t)(havePreviousBits_ & (uint8_t)~flag);
+    if (bit == first) {
+        return;
     }
 
-    ++windowBits_;
-    if (bit != 0) {
-        ++windowOnes_;
+    ++acceptedBits_;
+    // At most four accepted bits can be generated by one ADC conversion and
+    // next() drains the reservoir before taking another sample.
+    pendingValue_ = (uint16_t)((pendingValue_ << 1) | first);
+    ++pendingBits_;
+}
+
+void TRNG::mixSample(uint16_t value, uint8_t phase, uint8_t watchdogMix,
+                     uint8_t watchdogEvents) {
+    uint32_t digest = sampleDigest_;
+    digest = (uint32_t)((digest << 5) | (digest >> 27));
+    digest += (uint32_t)((uint8_t)value ^ (uint8_t)(value >> 8) ^ phase) +
+              0x9E3779B9UL;
+    digest ^= digest >> 7;
+#if MEGATRNG_ENABLE_WATCHDOG
+    if (watchdogEvents != 0) {
+        digest ^= (uint32_t)watchdogMix +
+                  ((uint32_t)watchdogEvents << 24);
+        digest = (uint32_t)((digest << 3) | (digest >> 29));
     }
-    if (windowBits_ == 0) {
-        // uint8_t wrap means a 256-sample window has completed.
-        if (windowOnes_ < 16U || windowOnes_ > 240U) {
+#else
+    (void)watchdogMix;
+    (void)watchdogEvents;
+#endif
+    sampleDigest_ = digest;
+
+    // Health history is deliberately updated after the digest so it cannot
+    // accidentally become the source of output bits.
+#if MEGATRNG_ENABLE_WIDE_PLANES
+    const uint8_t mask = config_.bitPlaneMask;
+    for (uint8_t plane = 0; plane < 4U; ++plane) {
+        const uint8_t flag = (uint8_t)(1U << plane);
+        if ((mask & flag) == 0) {
+            continue;
+        }
+        const uint8_t bit = (uint8_t)((value >> plane) & 1U);
+        const uint8_t previous = (uint8_t)((lastHealthBits_ >> plane) & 1U);
+        if ((healthHaveBits_ & flag) == 0) {
+            healthHaveBits_ = (uint8_t)(healthHaveBits_ | flag);
+            lastHealthBits_ = (uint8_t)((lastHealthBits_ & (uint8_t)~flag) |
+                                        (bit != 0 ? flag : 0));
+            healthRunLength_[plane] = 1;
+        } else if (bit == previous) {
+            if (healthRunLength_[plane] != 0xFFU) {
+                ++healthRunLength_[plane];
+            }
+        } else {
+            lastHealthBits_ = (uint8_t)((lastHealthBits_ & (uint8_t)~flag) |
+                                        (bit != 0 ? flag : 0));
+            healthRunLength_[plane] = 1;
+        }
+        if (healthRunLength_[plane] >= 128U) {
             healthFault_ = true;
         }
-        windowBits_ = 0;
-        windowOnes_ = 0;
+        if (bit != 0) {
+            ++healthWindowOnes_[plane];
+        }
+    }
+#else
+    const uint8_t bit = (uint8_t)(value & 1U);
+    const uint8_t previous = (uint8_t)(lastHealthBits_ & 1U);
+    if ((healthHaveBits_ & 1U) == 0) {
+        healthHaveBits_ |= 1U;
+        lastHealthBits_ = (uint8_t)(bit != 0 ? 1U : 0U);
+        healthRunLength_[0] = 1;
+    } else if (bit == previous) {
+        if (healthRunLength_[0] != 0xFFU) {
+            ++healthRunLength_[0];
+        }
+    } else {
+        lastHealthBits_ = (uint8_t)(bit != 0 ? 1U : 0U);
+        healthRunLength_[0] = 1;
+    }
+    if (healthRunLength_[0] >= 128U) {
+        healthFault_ = true;
+    }
+    if (bit != 0) {
+        ++healthWindowOnes_[0];
+    }
+#endif
+    ++healthWindowBits_;
+    if (healthWindowBits_ == 0) {
+#if MEGATRNG_ENABLE_WIDE_PLANES
+        const uint8_t mask = config_.bitPlaneMask;
+        for (uint8_t plane = 0; plane < 4U; ++plane) {
+            const uint8_t flag = (uint8_t)(1U << plane);
+            if ((mask & flag) != 0 &&
+                (healthWindowOnes_[plane] < 16U ||
+                 healthWindowOnes_[plane] > 240U)) {
+                healthFault_ = true;
+            }
+            healthWindowOnes_[plane] = 0;
+        }
+#else
+        if (healthWindowOnes_[0] < 16U || healthWindowOnes_[0] > 240U) {
+            healthFault_ = true;
+        }
+        healthWindowOnes_[0] = 0;
+#endif
+        healthWindowBits_ = 0;
     }
     ++rawSamples_;
 }
 
 void TRNG::absorbByte(uint8_t value) {
     s0_ ^= (uint32_t)value + 0x9E3779B9UL + (s3_ << 6) + (s3_ >> 2);
-    s1_ += rotl32(s0_, 5) ^ 0xA5A5A5A5UL;
-    s2_ ^= rotl32(s1_ + (uint32_t)value, 11);
-    s3_ += rotl32(s2_ ^ s0_, 17) + 0x7F4A7C15UL;
-    s0_ = rotl32(s0_ + s3_, 7);
-    s1_ ^= rotl32(s2_, 13);
-    s2_ += rotl32(s3_, 19);
-    s3_ ^= rotl32(s0_, 23);
+    s1_ += MEGATRNG_ROTL32(s0_, 5) ^ 0xA5A5A5A5UL;
+    s2_ ^= MEGATRNG_ROTL32(s1_ + (uint32_t)value, 11);
+    s3_ += MEGATRNG_ROTL32(s2_ ^ s0_, 17) + 0x7F4A7C15UL;
+    s0_ = MEGATRNG_ROTL32(s0_ + s3_, 7);
+    s1_ ^= MEGATRNG_ROTL32(s2_, 13);
+    s2_ += MEGATRNG_ROTL32(s3_, 19);
+    s3_ ^= MEGATRNG_ROTL32(s0_, 23);
 }
 
-void TRNG::absorbBit(uint8_t bit) {
-    ++acceptedBits_;
-    s0_ ^= (uint32_t)(bit & 1U) + 0xD1B54A35UL + acceptedBits_;
-    s1_ += rotl32(s0_, 5);
-    s2_ ^= rotl32(s1_, 11);
-    s3_ += rotl32(s2_, 17);
-    s0_ = rotl32(s0_ + s3_, 7);
-    s1_ ^= rotl32(s2_, 13);
-}
-
-uint8_t TRNG::squeezeByte() {
-    // Two short ARX rounds provide diffusion and make consecutive output
-    // bytes depend on the entire accumulated state.  This is a mixer, not a
-    // claim of cryptographic proof or a replacement for an entropy source.
-    absorbByte((uint8_t)(acceptedBits_ ^ (acceptedBits_ >> 8)));
-    uint32_t value = s0_ ^ rotl32(s1_, 7) ^ rotl32(s2_, 13) ^ rotl32(s3_, 21);
+uint8_t TRNG::squeezeByte(uint8_t input) {
+    // One ARX absorption per output is sufficient for this small mixer and
+    // removes a second full round from the hot next() path.
+    absorbByte(input);
+    uint32_t value = s0_ ^ MEGATRNG_ROTL32(s1_, 7) ^
+                     MEGATRNG_ROTL32(s2_, 13) ^ MEGATRNG_ROTL32(s3_, 21);
     value ^= value >> 16;
     value *= 0x7FEB352DUL;
     value ^= value >> 15;
@@ -356,31 +497,38 @@ bool TRNG::next(uint8_t &out, uint16_t maxRawSamples) {
     uint16_t samples = 0;
     out = 0;
     while (outputBits < 8U) {
+        // Drain accepted bits left over from a multi-plane sample first.  In
+        // turbo mode this is the common zero-conversion latency case.
+        while (pendingBits_ != 0 && outputBits < 8U) {
+            const uint8_t shift = (uint8_t)(pendingBits_ - 1U);
+            out = (uint8_t)((out << 1) | ((pendingValue_ >> shift) & 1U));
+            --pendingBits_;
+            if (shift == 0) {
+                pendingValue_ = 0;
+            } else {
+                pendingValue_ = (uint16_t)(pendingValue_ &
+                                            (uint16_t)((1U << shift) - 1U));
+            }
+            ++outputBits;
+        }
+        if (outputBits == 8U) {
+            break;
+        }
         if (maxRawSamples != 0 && samples >= maxRawSamples) {
             return false;
         }
-        uint8_t raw = sampleRawBit();
+        processSample(sampleAdc());
         ++samples;
         if (healthFault_) {
             return false;
         }
-
-        if (!havePrevious_) {
-            previousBit_ = raw;
-            havePrevious_ = 1;
-            continue;
-        }
-
-        uint8_t first = previousBit_;
-        havePrevious_ = 0; // non-overlapping pairs are essential to VN bias removal
-        if (raw == first) {
-            continue;
-        }
-        absorbBit(first); // 01 -> 0, 10 -> 1
-        ++outputBits;
-        out = (uint8_t)((out << 1) | first);
     }
-    out = (uint8_t)(out ^ squeezeByte());
+
+    const uint8_t input = (uint8_t)sampleDigest_ ^
+                          (uint8_t)(sampleDigest_ >> 8) ^ out ^
+                          (uint8_t)acceptedBits_ ^
+                          (uint8_t)(acceptedBits_ >> 8);
+    out = (uint8_t)(out ^ squeezeByte(input));
     return true;
 }
 
@@ -430,3 +578,5 @@ ISR(WDT_vect) {
     TRNG::onWatchdogInterrupt();
 }
 #endif
+
+#undef MEGATRNG_ROTL32
