@@ -108,6 +108,18 @@ python tools/coin_lln.py --list-ports
 python tools/coin_lln.py --serial COM7 --mode fast --flips 1000000 --capture artifacts/mega.mlln --csv artifacts/mega.csv --plot artifacts/mega.png
 ```
 
+For offline use, the one-command wrapper detects the USB Mega, uploads the
+collector, samples real board output and writes the capture/report files. It
+never falls back to a computer random source:
+
+```text
+python tools/run_mega_coin.py --flips 1000000
+```
+
+Use `--port COM9` when several USB serial devices are present and `--no-upload`
+when the collector firmware is already installed. See
+[the Chinese guide](docs/COIN_LLN.md) for wiring and output names.
+
 The board only collects/conditions bytes and sends binary frames at 1 Mbaud;
 the computer counts heads, computes errors and draws the curve. The host can
 select `conservative`, `fast` (default) or experimental `turbo` without reflashing.

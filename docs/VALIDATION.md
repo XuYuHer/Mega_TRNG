@@ -25,13 +25,14 @@ Arduino AVR framework 5.4.0、avr-g++ 7.3.0、Python 3.14.5。
 
 ## 构建
 
-`pio run -e megaatmega2560 -e megaatmega2560_min -e megaatmega2560_coin` 全部通过。
+`pio run -e megaatmega2560 -e megaatmega2560_min -e megaatmega2560_coin -e megaatmega2560_adcdiag` 全部通过。
 
 | 环境 | Flash | 静态 RAM |
 |---|---:|---:|
 | `megaatmega2560` | 9,448 B | 532 B |
 | `megaatmega2560_min` | 8,842 B | 529 B |
 | `megaatmega2560_coin` | 5,346 B | 513 B |
+| `megaatmega2560_adcdiag` | 1,950 B | 190 B |
 
 演示固件增加了格式化的批量速度统计，包含 Arduino 浮点打印支持；
 采集固件不做统计/绘图，也不使用浮点打印。所有构建都远低于 Mega 的 Flash/RAM 容量。

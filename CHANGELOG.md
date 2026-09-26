@@ -9,6 +9,10 @@
 - Honoured optional Timer1/WDT ownership; turbo now disables seasoning by default.
 - Replaced wrapping Timer1 byte timing with 512-byte micros() batch benchmarks.
 - Added a host-controlled 1 Mbaud collector with CRC, sequence and timing metadata.
+- Added `tools/run_mega_coin.py`: one command detects the board, uploads the
+  collector and performs a real serial experiment without a simulation fallback.
+- Added a raw A0 diagnostic profile/script for diagnosing health failures before
+  a conditioned collection run.
 - Added Python coin/LLN simulation, Mega collection, replay, CSV/JSON and PNG plots.
 - Added protocol/statistics tests, native library tests and an AVR cost comparison.
 - Corrected the watchdog interrupt-only WDIE behaviour described below and the

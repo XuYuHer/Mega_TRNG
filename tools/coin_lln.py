@@ -403,9 +403,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 collector = CollectorSource(FrameReader(handle))
                 chunks = collector.chunks()
                 source_name = "Mega capture replay"
-            else:
+            elif args.simulate:
                 chunks = iter_simulated_bytes((args.flips + 7) // 8, args.seed)
                 source_name = f"PC PRNG (seed={args.seed})" if args.seed is not None else "PC OS random"
+            else:
+                parser.error("choose --serial, --input, or explicitly --simulate")
             print(f"Collecting {args.flips:,} flips from {source_name}...", flush=True)
             start = time.perf_counter()
             try:

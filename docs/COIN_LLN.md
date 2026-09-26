@@ -31,8 +31,32 @@ python tools/coin_lln.py --simulate --flips 1000000 --seed 7 --csv artifacts/coi
 
 ## Mega 只负责采集
 
+如果你要离线使用，推荐直接运行这个一键脚本。它会自动识别 USB Mega/CH340 串口、
+上传采集固件、等待板子复位、采集真实 ADC 输出、校验帧并生成统计文件；没有串口时直接报错，
+不会改用电脑随机数：
+
+```powershell
+cd "E:\ZJU\乘浪\展示\Mega_TRNG"
+python tools/run_mega_coin.py --flips 1000000
+```
+
+默认使用 `fast` 模式，结果保存到 `artifacts/mega_fast_时间戳.*`：
+`.mlln` 是原始完整帧捕获，`.csv` 是累计曲线，`.json` 是统计和板端测速，`.png` 是图。
+指定 `--port COM9` 可跳过自动识别；使用 `--no-upload` 可复用已经烧录好的采集固件。
+例如：
+
+```powershell
+python tools/run_mega_coin.py --port COM9 --mode turbo --flips 1000000 --no-upload
+```
+
+脚本需要电脑已安装 PlatformIO CLI 和 `pyserial`；生成 PNG 还需要 `matplotlib`：
+
+```powershell
+python -m pip install -r tools/requirements.txt
+```
+
 将 Mega2560 接到电脑，A0 接入已有的模拟噪声源。悬空 A0 可做实验，但噪声是否充足取决于电路和环境。
-编译并上传专用采集固件：
+如果想分步操作，也可以手动编译并上传专用采集固件：
 
 ```powershell
 pio run -e megaatmega2560_coin
