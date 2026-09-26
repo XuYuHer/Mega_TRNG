@@ -1,5 +1,9 @@
 # MegaTRNG
 
+**中文使用说明：[抛硬币、大数定律与测速](docs/COIN_LLN.md)。**
+新增电脑模拟 / Mega 采集两种运行方式、CSV/JSON/收敛图、二进制串口协议。
+优化与实际检查结果见 [验证记录](docs/VALIDATION.md)。
+
 > **Real analogue noise in, auditable random bytes out — tuned for the ATmega2560.**
 >
 > **把 ATmega2560 的真实模拟噪声变成可审计、可测量的随机字节。**
@@ -36,7 +40,7 @@ bits. See the [comparison report](docs/COMPARISON.md) for the assumptions and
 fair measurement procedure.
 
 The repository never claims to have “beaten every project” without a same-board
-log. A quiet or driven ADC pin is detected and stops output; there is no PRNG
+log. Stuck or extremely biased sampled bits stop output; there is no PRNG
 fallback seeded from `millis()`, a fixed constant, or `random()`.
 
 ## Quick start
@@ -51,7 +55,7 @@ TRNG rng;
 
 void setup() {
   Serial.begin(115200);
-  TRNG::Config cfg;                 // conservative, conventional ADC timing
+  TRNG::Config cfg;                 // single-plane, speed-oriented ADC timing
   cfg.adcChannel = 0;               // A0
   cfg.adcPrescaler = TRNG::ADC_DIV_16;
   cfg.enableWatchdog = 1;
@@ -86,6 +90,34 @@ if (!rng.begin(cfg)) {
   // Invalid mask, resource conflict, or an immediate health failure.
 }
 ```
+
+## Coin toss and the law of large numbers
+
+Run a computer-only, reproducible million-flip experiment:
+
+```text
+python tools/coin_lln.py --simulate --flips 1000000 --seed 7
+```
+
+For Mega collection, upload the dedicated firmware and use the board's USB port:
+
+```text
+pio run -e megaatmega2560_coin -t upload
+python -m pip install -r tools/requirements.txt
+python tools/coin_lln.py --list-ports
+python tools/coin_lln.py --serial COM7 --mode fast --flips 1000000 --capture artifacts/mega.mlln --csv artifacts/mega.csv --plot artifacts/mega.png
+```
+
+The board only collects/conditions bytes and sends binary frames at 1 Mbaud;
+the computer counts heads, computes errors and draws the curve. The host can
+select `conservative`, `fast` (default) or experimental `turbo` without reflashing.
+Each frame carries its sequence, CRC and generation time. Corruption, gaps,
+health failures and stalled extraction stop the run explicitly.
+Replay with `--input artifacts/mega.mlln`. For plots from the PC simulation,
+add `--plot artifacts/coin.png`.
+
+See [the Chinese guide](docs/COIN_LLN.md) for wiring, commands, statistical
+assumptions, transport/generation timing and the complete protocol.
 
 `next(byte, limit)` bounds the number of new ADC conversions. It returns
 `false` on timeout or a health fault and never substitutes deterministic data.
@@ -134,7 +166,10 @@ claim.
 
 `Config::fast()` selects free-running ADC at `/16`. `Config::turbo()` selects
 free-running `/2` and mask `0x0F`; `/2` is outside the conventional 50–200 kHz
-ADC accuracy range and is intentionally opt-in.
+ADC accuracy range and is intentionally opt-in. Turbo now disables optional
+Timer1/WDT seasoning by default; applications can explicitly enable it again.
+At 16 MHz even `/16` is a 1 MHz ADC clock, above the full-accuracy recommendation;
+"conservative" describes the single-plane extractor, not a precision ADC setting.
 
 Compile-time flags remove seasoning code when the application does not need it:
 
@@ -154,7 +189,8 @@ small build; that build accepts only `bitPlaneMask = 0x01`.
   configure the ADC, optionally claim Timer1 and WDT, and absorb warm-up samples.
 - `void end()`: stop free-running ADC, restore saved ADC/Timer1/DIDR/WDT state.
 - `bool next(uint8_t& out, uint16_t maxRawSamples = 0)`: get one byte;
-  `0` waits, a non-zero limit bounds new conversions.
+  `0` waits, a non-zero limit bounds new consumed ADC samples. Partial bytes
+  survive bounded timeouts, and `out` stays unchanged when the call fails.
 - `uint8_t next()`: convenience wrapper that returns zero if the reference call
   fails.
 - `size_t fill(void* buffer, size_t length)`: fill until complete or a fault.
@@ -167,18 +203,20 @@ Timer1, the ADC multiplexer and the WDT vector are shared MCU resources. Call
 
 ## Performance, size and measurement
 
-The included `src/main.cpp` and `examples/Benchmark` measure each byte with
-Timer1, print CPU cycles and µs/byte, run frequency/runs/128-bit-block smoke
-tests, and print linker symbols plus `sizeof(TRNG)`. The Timer1 counter wraps in
-4.096 ms, so keep each measurement interval below that limit or use a wider
-measurement harness.
+The demo uses `Config::fast()` and measures 512-byte batches with `micros()`.
+UART output is drained before timing, and results include µs/byte, bytes/s,
+consumed ADC samples and accepted bits. The Benchmark example compares all
+three modes with the same optional seasoning disabled. This works in minimal
+builds and avoids the old 4.096 ms Timer1 wrap. The demo also runs
+frequency/runs/128-bit-block smoke tests; these are not NIST certification.
 
 Known from this checkout before a board run:
 
 | Build | Flash | Static RAM | Status |
 |---|---:|---:|---|
-| `megaatmega2560` demo | **7,882 B** | **521 B** | PlatformIO build with `-Os -flto`, not a board throughput measurement |
-| `megaatmega2560_min` demo | **7,254 B** | **518 B** | Watchdog, Timer1 seasoning and wide-plane loops compiled out |
+| `megaatmega2560` demo | **9,448 B** | **532 B** | PlatformIO build with `-Os -flto`; includes formatted batch statistics |
+| `megaatmega2560_min` demo | **8,842 B** | **529 B** | Watchdog, Timer1 seasoning and wide-plane loops compiled out |
+| `megaatmega2560_coin` collector | **5,346 B** | **513 B** | Binary collection and timing; analysis runs on the computer |
 
 The `/16` 416 µs/byte and turbo `/2` 13 µs/byte values are conversion floors
 under stated ideal assumptions. They exclude software and do not certify entropy.
@@ -241,10 +279,11 @@ pio ci lib/MegaTRNG/examples/Turbo/Turbo.ino --board megaatmega2560 --lib=lib/Me
 9. **Documentation review:** moved all speed numbers into a labelled
    theoretical-floor table and added the source-linked comparison report.
 
-The design has converged for the current constraints. A further large speedup
-would require an ADC interrupt/ring-buffer design or relaxing the extractor;
-both change latency, RAM and validation assumptions enough to deserve a separate
-backend.
+The current hot path shares pair boundaries across planes, uses fixed plane
+offsets, and drains the reservoir a byte at a time. The ADC source, health
+thresholds, Von Neumann rule and ARX conditioning are retained.
+See [validation](docs/VALIDATION.md) for a reproducible AVR instruction cost
+comparison; actual board throughput must still be measured.
 
 ## Limits and honest claims / 限制与诚实声明
 
@@ -264,7 +303,8 @@ backend.
 ## Roadmap
 
 - Publish labelled Mega2560 raw captures and a reproducible entropy estimator.
-- Add a host tool for per-plane and cross-plane tests.
+- Add raw ADC capture and host per-plane/cross-plane tests (the coin capture
+  currently contains conditioned output, not raw ADC samples).
 - Add CI across several Arduino AVR core versions.
 - Add an optional ADC interrupt backend only after RAM and ISR costs are measured.
 
@@ -274,11 +314,17 @@ backend.
 lib/MegaTRNG/
   src/TRNG.h, TRNG.cpp             library implementation
   examples/Basic/                  minimal serial example
-  examples/Benchmark/              Timer1 benchmark
+  examples/Benchmark/              512-byte batch benchmark
   examples/Turbo/                  explicit multi-plane experiment
   library.json                     PlatformIO metadata
   library.properties               Arduino Library Manager metadata
 src/main.cpp                       demo, size report and smoke tests
+src/coin_collector.cpp             Mega binary collector, host-controlled modes
+tools/coin_lln.py                   PC simulation / serial collection / replay
+tools/check.py                     protocol and native library regression checks
+tools/benchmark_avr.py             repeatable AVR software-cost comparison
+docs/COIN_LLN.md                    Chinese experiment and protocol guide
+docs/VALIDATION.md                  build, simulation and validation evidence
 docs/COMPARISON.md                 source-linked comparison report
 docs/README.md                     documentation landing page
 platformio.ini                     Mega2560 build environments

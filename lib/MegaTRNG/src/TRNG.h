@@ -62,12 +62,14 @@ public:
 
         Config();
 
-        // Fast keeps the conventional /16 ADC clock but starts conversions
+        // Fast keeps the speed-oriented /16 ADC clock but starts conversions
         // continuously, removing one ADSC setup per sample.
         static Config fast();
 
         // Turbo is an opt-in experiment: /2 ADC clock and four low bit planes.
-        // The ADC clock is outside the usual 50..200 kHz accuracy range and
+        // It disables optional Timer1/WDT seasoning because those resources
+        // add latency without increasing the collected VN bit rate.  The ADC
+        // clock is outside the usual 50..200 kHz accuracy range and
         // cross-plane independence must be validated on the user's hardware.
         static Config turbo();
     };
@@ -90,11 +92,12 @@ public:
      * Read one byte.  maxRawSamples == 0 waits until eight debiased bits are
      * available.  A non-zero limit makes the call bounded and is useful in a
      * cooperative loop.  The function returns false on a health fault or when
-     * the bound expires.  No pseudo-random fallback is used.
+     * the bound expires. Partial bytes are retained across bounded calls;
+     * out is unchanged on failure. No pseudo-random fallback is used.
      */
     bool next(uint8_t &out, uint16_t maxRawSamples = 0);
 
-    // Convenience wrapper: returns zero only when next() reports failure.
+    // Convenience wrapper: returns zero on failure (also a valid random byte).
     uint8_t next();
 
     // Fill as many bytes as possible; stops on a health fault.
@@ -114,9 +117,8 @@ private:
     bool started_;
     volatile bool healthFault_;
     uint8_t previousBits_;
-    uint8_t havePreviousBits_;
+    bool havePreviousSample_;
     uint8_t lastHealthBits_;
-    uint8_t healthHaveBits_;
     uint8_t healthWindowBits_;
     uint8_t healthRunLength_[4];
     uint8_t healthWindowOnes_[4];
@@ -157,7 +159,9 @@ private:
     void restoreWatchdog();
     uint16_t sampleAdc();
     void processSample(uint16_t value);
-    void acceptPlaneBit(uint8_t plane, uint8_t bit);
+    void acceptSample(uint8_t value);
+    void appendBit(uint8_t bit);
+    template <uint8_t Plane> void inspectPlane(uint8_t value);
     void mixSample(uint16_t value, uint8_t phase, uint8_t watchdogMix,
                    uint8_t watchdogEvents);
     void absorbByte(uint8_t value);

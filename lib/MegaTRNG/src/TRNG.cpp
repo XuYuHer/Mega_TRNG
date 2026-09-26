@@ -39,6 +39,10 @@ TRNG::Config TRNG::Config::turbo() {
     config.freeRunning = 1;
     config.adcPrescaler = TRNG::ADC_DIV_2;
     config.bitPlaneMask = 0x0F;
+    // Turbo is intended to move data, not to add a slow timing side channel.
+    // Applications that need the extra seasoning can turn these back on.
+    config.enableWatchdog = 0;
+    config.claimTimer1 = 0;
     return config;
 }
 
@@ -47,9 +51,8 @@ TRNG::TRNG()
       started_(false),
       healthFault_(false),
       previousBits_(0),
-      havePreviousBits_(0),
+      havePreviousSample_(false),
       lastHealthBits_(0),
-      healthHaveBits_(0),
       healthWindowBits_(0),
       healthRunLength_{0, 0, 0, 0},
       healthWindowOnes_{0, 0, 0, 0},
@@ -113,20 +116,25 @@ bool TRNG::begin(const Config &config) {
 #if defined(DIDR2)
     savedDidr2_ = DIDR2;
 #endif
-    savedTccr1a_ = TCCR1A;
-    savedTccr1b_ = TCCR1B;
-    savedTccr1c_ = TCCR1C;
-    savedTcnt1_ = TCNT1;
-    savedTimsk1_ = TIMSK1;
+#if MEGATRNG_ENABLE_TIMER1_PHASE
+    if (config_.claimTimer1) {
+        ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+            savedTccr1a_ = TCCR1A;
+            savedTccr1b_ = TCCR1B;
+            savedTccr1c_ = TCCR1C;
+            savedTcnt1_ = TCNT1;
+            savedTimsk1_ = TIMSK1;
+        }
+    }
+#endif
 
     s0_ = 0x243F6A88UL;
     s1_ = 0x85A308D3UL;
     s2_ = 0x13198A2EUL;
     s3_ = 0x03707344UL;
     previousBits_ = 0;
-    havePreviousBits_ = 0;
+    havePreviousSample_ = false;
     lastHealthBits_ = 0;
-    healthHaveBits_ = 0;
     healthWindowBits_ = 0;
     for (uint8_t plane = 0; plane < 4U; ++plane) {
         healthRunLength_[plane] = 0;
@@ -169,8 +177,10 @@ bool TRNG::begin(const Config &config) {
         uint16_t value = sampleAdc();
         uint8_t phase = 0;
 #if MEGATRNG_ENABLE_TIMER1_PHASE
-        ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-            phase = (uint8_t)(TCNT1L ^ TCNT1H);
+        if (timerClaimed_ != 0) {
+            ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+                phase = (uint8_t)(TCNT1L ^ TCNT1H);
+            }
         }
 #endif
         mixSample(value, phase, 0, 0);
@@ -205,7 +215,10 @@ void TRNG::end() {
 
 void TRNG::configureAdc() {
     const uint8_t channel = config_.adcChannel;
-    ADMUX = (uint8_t)(_BV(REFS0) | (channel & 0x0F));
+    // MUX5 selects the upper bank. MUX3 must stay clear for ADC8..15;
+    // setting it would select a differential input instead.
+    ADCSRA = 0;
+    ADMUX = (uint8_t)(_BV(REFS0) | (channel & 0x07));
 #if defined(MUX5)
     ADCSRB = (uint8_t)((ADCSRB & (uint8_t)~_BV(MUX5)) |
                        ((channel & 0x08U) ? _BV(MUX5) : 0));
@@ -251,6 +264,7 @@ void TRNG::configureTimer1() {
 
 void TRNG::configureWatchdog() {
 #if MEGATRNG_ENABLE_WATCHDOG
+    wdt_reset();
     savedWdtcsr_ = WDTCSR;
     MCUSR = (uint8_t)(MCUSR & (uint8_t)~_BV(WDRF));
     // WDCE/WDE must be written in the four-cycle configuration window.  A
@@ -262,6 +276,7 @@ void TRNG::configureWatchdog() {
 
 void TRNG::restoreWatchdog() {
 #if MEGATRNG_ENABLE_WATCHDOG
+    wdt_reset();
     MCUSR = (uint8_t)(MCUSR & (uint8_t)~_BV(WDRF));
     WDTCSR = (uint8_t)(_BV(WDCE) | _BV(WDE));
     WDTCSR = savedWdtcsr_;
@@ -269,9 +284,11 @@ void TRNG::restoreWatchdog() {
 }
 
 void TRNG::restoreHardware() {
+    // Stop free-running conversions before restoring the mux/reference.
+    ADCSRA = 0;
     ADMUX = savedAdmux_;
-    ADCSRA = savedAdcsra_;
     ADCSRB = savedAdcsrb_;
+    ADCSRA = savedAdcsra_;
 #if defined(DIDR0)
     DIDR0 = savedDidr0_;
 #endif
@@ -314,58 +331,83 @@ void TRNG::processSample(uint16_t value) {
     const uint8_t watchdogMix = 0;
     const uint8_t watchdogEvents = 0;
 #endif
-    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+#if MEGATRNG_ENABLE_TIMER1_PHASE || MEGATRNG_ENABLE_WATCHDOG
+    // A collector can disable both seasoning sources.  Avoid the CLI/SEI
+    // pair in that configuration; this function is on the hottest path.
+    if (timerClaimed_ != 0 || watchdogClaimed_ != 0) {
+        ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
 #if MEGATRNG_ENABLE_TIMER1_PHASE
-        phase = (uint8_t)(TCNT1L ^ TCNT1H);
+            if (timerClaimed_ != 0) {
+                phase = (uint8_t)(TCNT1L ^ TCNT1H);
+            }
 #endif
 #if MEGATRNG_ENABLE_WATCHDOG
-        watchdogMix = g_wdtMix;
-        watchdogEvents = g_wdtEvents;
-        g_wdtEvents = 0;
+            if (watchdogClaimed_ != 0) {
+                watchdogMix = g_wdtMix;
+                watchdogEvents = g_wdtEvents;
+                g_wdtEvents = 0;
+            }
 #endif
+        }
     }
+#endif
 
     // Timer phase and watchdog phase season a rolling digest.  The debiased
     // bits still come only from ADC bit planes; deterministic counters never
     // become an entropy source by being mixed in here.
     mixSample(value, phase, watchdogMix, watchdogEvents);
 
-#if MEGATRNG_ENABLE_WIDE_PLANES
-    const uint8_t mask = config_.bitPlaneMask;
-    for (uint8_t plane = 0; plane < 4U; ++plane) {
-        const uint8_t flag = (uint8_t)(1U << plane);
-        if ((mask & flag) != 0) {
-            acceptPlaneBit(plane, (uint8_t)((value >> plane) & 1U));
-        }
+    if (!healthFault_) {
+        acceptSample((uint8_t)value);
     }
-#else
-    acceptPlaneBit(0, (uint8_t)(value & 1U));
+}
+
+void TRNG::acceptSample(uint8_t value) {
+    // All enabled planes observe the same conversions, so their pair
+    // boundaries are identical. One XOR finds all unequal VN pairs at once.
+    if (!havePreviousSample_) {
+        previousBits_ = value;
+        havePreviousSample_ = true;
+        return;
+    }
+    havePreviousSample_ = false;
+    const uint8_t accepted = (uint8_t)((previousBits_ ^ value) & config_.bitPlaneMask);
+    // Fixed shifts compile to AVR bit instructions, avoiding variable shifts
+    // and per-plane pair bookkeeping. Preserve ascending plane order.
+    if (accepted & 0x01U) appendBit(previousBits_ & 1U);
+#if MEGATRNG_ENABLE_WIDE_PLANES
+    if (accepted & 0x02U) appendBit((previousBits_ >> 1) & 1U);
+    if (accepted & 0x04U) appendBit((previousBits_ >> 2) & 1U);
+    if (accepted & 0x08U) appendBit((previousBits_ >> 3) & 1U);
 #endif
 }
 
-void TRNG::acceptPlaneBit(uint8_t plane, uint8_t bit) {
-    const uint8_t flag = (uint8_t)(1U << plane);
-    if ((havePreviousBits_ & flag) == 0) {
-        if (bit != 0) {
-            previousBits_ = (uint8_t)(previousBits_ | flag);
-        } else {
-            previousBits_ = (uint8_t)(previousBits_ & (uint8_t)~flag);
-        }
-        havePreviousBits_ = (uint8_t)(havePreviousBits_ | flag);
-        return;
-    }
-
-    const uint8_t first = (previousBits_ & flag) != 0 ? 1U : 0U;
-    havePreviousBits_ = (uint8_t)(havePreviousBits_ & (uint8_t)~flag);
-    if (bit == first) {
-        return;
-    }
-
+void TRNG::appendBit(uint8_t bit) {
     ++acceptedBits_;
-    // At most four accepted bits can be generated by one ADC conversion and
-    // next() drains the reservoir before taking another sample.
-    pendingValue_ = (uint16_t)((pendingValue_ << 1) | first);
+    // Before a conversion there are at most seven pending bits; a conversion
+    // adds at most four, so the 16-bit reservoir cannot overflow.
+    pendingValue_ = (uint16_t)((pendingValue_ << 1) | bit);
     ++pendingBits_;
+}
+
+template <uint8_t Plane>
+void TRNG::inspectPlane(uint8_t value) {
+    const uint8_t flag = (uint8_t)(1U << Plane);
+    if (((value ^ lastHealthBits_) & flag) == 0) {
+        ++healthRunLength_[Plane];
+    } else {
+        healthRunLength_[Plane] = 1;
+    }
+    if (healthRunLength_[Plane] >= 128U) {
+        healthFault_ = true;
+    }
+    healthWindowOnes_[Plane] += (value & flag) != 0;
+    if (healthWindowBits_ == 0) {
+        if (healthWindowOnes_[Plane] < 16U || healthWindowOnes_[Plane] > 240U) {
+            healthFault_ = true;
+        }
+        healthWindowOnes_[Plane] = 0;
+    }
 }
 
 void TRNG::mixSample(uint16_t value, uint8_t phase, uint8_t watchdogMix,
@@ -387,81 +429,19 @@ void TRNG::mixSample(uint16_t value, uint8_t phase, uint8_t watchdogMix,
 #endif
     sampleDigest_ = digest;
 
-    // Health history is deliberately updated after the digest so it cannot
-    // accidentally become the source of output bits.
+    // Keep every health check, using fixed plane offsets on this 8-bit CPU.
+    // A 256-one window cannot overflow unnoticed: the run test stops at 128.
+    ++healthWindowBits_;
 #if MEGATRNG_ENABLE_WIDE_PLANES
     const uint8_t mask = config_.bitPlaneMask;
-    for (uint8_t plane = 0; plane < 4U; ++plane) {
-        const uint8_t flag = (uint8_t)(1U << plane);
-        if ((mask & flag) == 0) {
-            continue;
-        }
-        const uint8_t bit = (uint8_t)((value >> plane) & 1U);
-        const uint8_t previous = (uint8_t)((lastHealthBits_ >> plane) & 1U);
-        if ((healthHaveBits_ & flag) == 0) {
-            healthHaveBits_ = (uint8_t)(healthHaveBits_ | flag);
-            lastHealthBits_ = (uint8_t)((lastHealthBits_ & (uint8_t)~flag) |
-                                        (bit != 0 ? flag : 0));
-            healthRunLength_[plane] = 1;
-        } else if (bit == previous) {
-            if (healthRunLength_[plane] != 0xFFU) {
-                ++healthRunLength_[plane];
-            }
-        } else {
-            lastHealthBits_ = (uint8_t)((lastHealthBits_ & (uint8_t)~flag) |
-                                        (bit != 0 ? flag : 0));
-            healthRunLength_[plane] = 1;
-        }
-        if (healthRunLength_[plane] >= 128U) {
-            healthFault_ = true;
-        }
-        if (bit != 0) {
-            ++healthWindowOnes_[plane];
-        }
-    }
+    if (mask & 0x01U) inspectPlane<0>((uint8_t)value);
+    if (mask & 0x02U) inspectPlane<1>((uint8_t)value);
+    if (mask & 0x04U) inspectPlane<2>((uint8_t)value);
+    if (mask & 0x08U) inspectPlane<3>((uint8_t)value);
 #else
-    const uint8_t bit = (uint8_t)(value & 1U);
-    const uint8_t previous = (uint8_t)(lastHealthBits_ & 1U);
-    if ((healthHaveBits_ & 1U) == 0) {
-        healthHaveBits_ |= 1U;
-        lastHealthBits_ = (uint8_t)(bit != 0 ? 1U : 0U);
-        healthRunLength_[0] = 1;
-    } else if (bit == previous) {
-        if (healthRunLength_[0] != 0xFFU) {
-            ++healthRunLength_[0];
-        }
-    } else {
-        lastHealthBits_ = (uint8_t)(bit != 0 ? 1U : 0U);
-        healthRunLength_[0] = 1;
-    }
-    if (healthRunLength_[0] >= 128U) {
-        healthFault_ = true;
-    }
-    if (bit != 0) {
-        ++healthWindowOnes_[0];
-    }
+    inspectPlane<0>((uint8_t)value);
 #endif
-    ++healthWindowBits_;
-    if (healthWindowBits_ == 0) {
-#if MEGATRNG_ENABLE_WIDE_PLANES
-        const uint8_t mask = config_.bitPlaneMask;
-        for (uint8_t plane = 0; plane < 4U; ++plane) {
-            const uint8_t flag = (uint8_t)(1U << plane);
-            if ((mask & flag) != 0 &&
-                (healthWindowOnes_[plane] < 16U ||
-                 healthWindowOnes_[plane] > 240U)) {
-                healthFault_ = true;
-            }
-            healthWindowOnes_[plane] = 0;
-        }
-#else
-        if (healthWindowOnes_[0] < 16U || healthWindowOnes_[0] > 240U) {
-            healthFault_ = true;
-        }
-        healthWindowOnes_[0] = 0;
-#endif
-        healthWindowBits_ = 0;
-    }
+    lastHealthBits_ = (uint8_t)value;
     ++rawSamples_;
 }
 
@@ -493,27 +473,8 @@ bool TRNG::next(uint8_t &out, uint16_t maxRawSamples) {
         return false;
     }
 
-    uint8_t outputBits = 0;
     uint16_t samples = 0;
-    out = 0;
-    while (outputBits < 8U) {
-        // Drain accepted bits left over from a multi-plane sample first.  In
-        // turbo mode this is the common zero-conversion latency case.
-        while (pendingBits_ != 0 && outputBits < 8U) {
-            const uint8_t shift = (uint8_t)(pendingBits_ - 1U);
-            out = (uint8_t)((out << 1) | ((pendingValue_ >> shift) & 1U));
-            --pendingBits_;
-            if (shift == 0) {
-                pendingValue_ = 0;
-            } else {
-                pendingValue_ = (uint16_t)(pendingValue_ &
-                                            (uint16_t)((1U << shift) - 1U));
-            }
-            ++outputBits;
-        }
-        if (outputBits == 8U) {
-            break;
-        }
+    while (pendingBits_ < 8U) {
         if (maxRawSamples != 0 && samples >= maxRawSamples) {
             return false;
         }
@@ -524,11 +485,16 @@ bool TRNG::next(uint8_t &out, uint16_t maxRawSamples) {
         }
     }
 
+    // Extract a whole byte once. Leave partial output in the reservoir when
+    // a bounded call times out so small cooperative reads always make progress.
+    pendingBits_ -= 8U;
+    const uint8_t extracted = (uint8_t)(pendingValue_ >> pendingBits_);
+    pendingValue_ &= (uint16_t)((1U << pendingBits_) - 1U);
     const uint8_t input = (uint8_t)sampleDigest_ ^
-                          (uint8_t)(sampleDigest_ >> 8) ^ out ^
+                          (uint8_t)(sampleDigest_ >> 8) ^ extracted ^
                           (uint8_t)acceptedBits_ ^
                           (uint8_t)(acceptedBits_ >> 8);
-    out = (uint8_t)(out ^ squeezeByte(input));
+    out = (uint8_t)(extracted ^ squeezeByte(input));
     return true;
 }
 
@@ -560,16 +526,17 @@ void TRNG::onWatchdogInterrupt() {
     }
     uint8_t sample = ++g_wdtSequence;
 #if MEGATRNG_ENABLE_TIMER1_PHASE
-    uint8_t low = TCNT1L;
-    uint8_t high = TCNT1H;
-    sample = (uint8_t)(sample ^ low ^ high);
+    if (active_->timerClaimed_ != 0) {
+        uint8_t low = TCNT1L;
+        uint8_t high = TCNT1H;
+        sample = (uint8_t)(sample ^ low ^ high);
+    }
 #endif
     g_wdtMix = (uint8_t)((g_wdtMix << 3) | (g_wdtMix >> 5));
     g_wdtMix ^= (uint8_t)(sample + 0xA7U);
     ++g_wdtEvents;
-    // ATmega2560 clears WDIE automatically when an interrupt is serviced.
-    // Re-arm it so the independent oscillator contributes periodically.
-    WDTCSR |= _BV(WDIE);
+    // Interrupt-only mode (WDE=0) keeps WDIE set after the ISR. Automatic
+    // clearing only applies to combined interrupt-and-reset mode.
 #endif
 }
 

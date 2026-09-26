@@ -1,47 +1,30 @@
 #include <TRNG.h>
-#include <util/atomic.h>
+#include <TRNGBenchmark.h>
 
 TRNG trng;
 
-static uint16_t timer1Value() {
-  uint8_t low = 0;
-  uint8_t high = 0;
-  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-    low = TCNT1L;
-    high = TCNT1H;
-  }
-  return static_cast<uint16_t>(low) | (static_cast<uint16_t>(high) << 8);
-}
-
 void setup() {
   Serial.begin(115200);
-  TRNG::Config config;
-  config.adcChannel = 0;
-  config.adcPrescaler = TRNG::ADC_DIV_16;
-  config.warmupSamples = 64;
-  config.enableWatchdog = 1;
-  config.claimTimer1 = 1;
-  if (!trng.begin(config)) {
-    Serial.println(F("begin() failed"));
-    return;
-  }
-
-  uint32_t cycles = 0;
-  const uint8_t count = 16;
-  for (uint8_t i = 0; i < count; ++i) {
-    const uint16_t before = timer1Value();
-    uint8_t value = 0;
-    if (!trng.next(value, 0)) {
-      Serial.println(F("health fault"));
-      return;
+  // Same optional sources in all modes; micros() also works in minimal builds.
+  for (uint8_t mode = 0; mode < 3; ++mode) {
+#if !MEGATRNG_ENABLE_WIDE_PLANES
+    if (mode == 2) break;
+#endif
+    TRNG::Config config = mode == 2 ? TRNG::Config::turbo() : TRNG::Config::fast();
+    if (mode == 0) config.freeRunning = 0;
+    config.claimTimer1 = 0;
+    config.enableWatchdog = 0;
+    config.warmupSamples = 256;
+    Serial.println(mode == 0 ? F("conservative /16 single-shot") :
+                   mode == 1 ? F("fast /16 free-running") :
+                               F("turbo /2 four planes (experimental)"));
+    if (trng.begin(config)) {
+      benchmarkTRNG(trng, 512);
+      trng.end();
+    } else {
+      Serial.println(F("begin failed; check analogue source"));
     }
-    cycles += static_cast<uint16_t>(timer1Value() - before);
   }
-  const uint32_t avg = cycles / count;
-  Serial.print(F("Timer1 cycles/byte="));
-  Serial.println(avg);
-  Serial.print(F("us/byte="));
-  Serial.println(avg / (F_CPU / 1000000UL));
 }
 
 void loop() {}

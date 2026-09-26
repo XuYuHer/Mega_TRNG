@@ -1,6 +1,7 @@
 # Mega2560 TRNG comparison / 对比报告
 
-This is a source and build comparison, not a leaderboard.  Only a connected
+This is a source and build comparison, not a leaderboard. Current build and
+software-cost results are in [VALIDATION.md](VALIDATION.md). Only a connected
 Mega2560 can provide the board timing and noise data needed for a throughput or
 entropy claim.  The checkout used for this report builds with PlatformIO's
 Arduino AVR core 5.4.0, avr-g++ 7.3.0 and `-Os -flto`; the external projects are
@@ -15,7 +16,7 @@ Mega2560 后测量；外部项目没有可复现的 Mega2560 数据时，本报�
 
 | Implementation | Physical source | Debias / conditioning | Blocking behaviour | Mega2560 status | Speed/size evidence |
 |---|---|---|---|---|---|
-| **MegaTRNG `Config()`** | Floating/noisy ADC LSB; Timer1 phase and WDT oscillator are seasoning | Non-overlapping Von Neumann, 128-bit ARX mixer, repetition + proportion health stop | `next(out, 0)` waits for a byte; bounded overload returns `false` | **Built for ATmega2560** | This checkout: 7,882 B flash / 521 B static RAM for the demo. `/16` sampling floor is about 416 µs/byte before overhead; board result **unmeasured here** |
+| **MegaTRNG `Config()`** | Floating/noisy ADC LSB; Timer1 phase and WDT oscillator are seasoning | Non-overlapping Von Neumann, 128-bit ARX mixer, repetition + proportion health stop | `next(out, 0)` waits for a byte; bounded overload returns `false` | **Built for ATmega2560** | See the current build sizes in VALIDATION.md. `/16` sampling floor is about 416 µs/byte before overhead; board result **unmeasured here** |
 | **MegaTRNG `Config::fast()`** | Same ADC LSB source | Same | Same API; free-running ADC removes per-sample ADSC setup | **Built path; board result pending** | Same physical floor, lower software overhead; no fabricated cycle number |
 | **MegaTRNG `Config::turbo()`** | ADC planes 0..3 from the same conversion | One VN pair per plane, per-plane health checks, surplus-bit reservoir, ARX mixer | Usually fewer conversions per call; still blocks when reservoir is empty | **Compiles; experimental** | `/2` ADC + four candidate planes gives a theoretical source floor near 13 µs/byte. ADC timing is outside the conventional accuracy range and cross-plane independence is **unverified** |
 | [Arduino AVR `random()`](https://github.com/arduino/ArduinoCore-avr/blob/master/cores/arduino/WMath.cpp) | None; deterministic PRNG | No extractor | Non-blocking | Builds on Mega2560 | Fast, but it is not a TRNG and is therefore not a like-for-like competitor |
@@ -37,7 +38,7 @@ ADC 转换时间乘以期望原始采样数；它不包含软件、ISR、建立�
 MegaTRNG's conservative stream uses one ADC LSB and one non-overlapping VN
 extractor.  With a 16 MHz CPU and `/16` ADC prescaler, the 13 ADC-clock
 conversion is about 208 CPU cycles (13 µs).  An unbiased VN pair accepts one bit
-with probability 1/4 per two samples, so eight output bits need about 32 raw
+with probability 1/2 per two samples (1/4 bit per raw sample), so eight output bits need about 32 raw
 conversions: **416 µs/byte is a floor, not a measurement**.
 
 `Config::fast()` lets the ADC free-run.  It cannot create entropy or beat the
@@ -63,11 +64,11 @@ interrupt period.
    experiment, not a quantified security source; record the wiring, reference
    voltage, board revision, supply and temperature.
 2. Build this checkout with `pio run -e megaatmega2560`, upload it, and open a
-   115200 baud monitor. `src/main.cpp` prints Timer1 cycles and microseconds per
+   115200 baud monitor. `src/main.cpp` prints 512-byte batch microseconds per
    byte, raw/accepted counters, smoke-test results, and linker sizes.
 3. Repeat with `Config::fast()` and `Config::turbo()` in the example. Measure at
-   least 128 bytes after warm-up; report median and percentile values because VN
-   rejection makes individual calls variable.
+   least 512 bytes after warm-up; repeat batches because VN rejection makes
+   individual calls variable. The Benchmark example selects all three modes.
 4. For turbo, capture the raw four-plane values before the mixer and test each
    plane and cross-plane pairs. A monobit/runs/block smoke test is useful for
    regressions; it is not an entropy certification. For security work, perform
@@ -90,8 +91,9 @@ pio device monitor -b 115200
 
 On a Mega2560, MegaTRNG's defensible advantage is the combination of a direct
 ADC path, one VN pass, free-running sampling, and an API that exposes a bounded
-read without a deterministic fallback.  The conservative mode is the only mode
-whose timing assumptions are conventional.  Turbo may be much faster on a
+read without a deterministic fallback. Even `/16` is a 1 MHz ADC clock, above
+the 50-200 kHz recommendation for full 10-bit accuracy. Its single-plane model
+is more conservative than the turbo multi-plane assumption. Turbo may be faster on a
 particular board, but until raw captures and board logs exist it is a
 throughput experiment, not proof that MegaTRNG “beats every project” or that its
 four planes contain four independent bits.
